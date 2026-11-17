@@ -90,7 +90,6 @@ void draw() {
     }
 
     setCursorPosition(0, 0);
-    // CORRIGIDO BUG 2 (Espaçamentos largos no final garantem limpar resíduos velhos da linha do prompt)
     
     printf("HOST: %-15s (Bola 1) | GUEST: %-15s (Bola 2)                \n", gameState.name1, gameState.name2);
     printf("PLACAR - %-15s: %d vitorias | %-15s: %d vitorias                   \n", gameState.name1, gameState.score1, gameState.name2, gameState.score2);

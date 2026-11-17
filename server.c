@@ -20,7 +20,7 @@
 
 sqlite3 *db;
 
-// Função personalizada de Log (Console + Arquivo txt)
+
 void server_log(const char *format, ...) {
     time_t now = time(NULL);
     struct tm *t = localtime(&now);
@@ -30,11 +30,9 @@ void server_log(const char *format, ...) {
     va_list args;
     va_start(args, format);
     
-    // Imprime no console
     printf("[%s] ", time_str);
     vprintf(format, args);
     
-    // Imprime no arquivo
     FILE *f = fopen("server_log.txt", "a");
     if(f) {
         fprintf(f, "[%s] ", time_str);
@@ -229,7 +227,6 @@ DWORD WINAPI RoomThread(LPVOID arg) {
                     closesocket(r->p1);
                     r->p1 = 0;
                     
-                    // MIGRAÇÃO DE HOST: Guest assume a sala
                     if(r->p2) {
                         server_log("[SALA %d] '%s' agora e o novo HOST.\n", r->id, r->name2);
                         r->p1 = r->p2;
@@ -239,7 +236,7 @@ DWORD WINAPI RoomThread(LPVOID arg) {
                         r->score1 = r->score2;
                         r->score2 = 0;
                         r->current_player = 1;
-                        r->game_status = 0; // Volta para tela de espera
+                        r->game_status = 0;
                         initBalls(r);
                     }
                 } else if(r->game_status == 1 && r->current_player == 1) {
@@ -256,10 +253,10 @@ DWORD WINAPI RoomThread(LPVOID arg) {
                     initBalls(r); r->game_status = 1; r->winner = 0; r->current_player = 1;
                 }
             }
-            // VERIFICA JOGADOR 2
+
             if(r->p2 && FD_ISSET(r->p2, &readfds)) {
                 int res = recv(r->p2, (char*)&cmsg, sizeof(cmsg), 0);
-                if(res <= 0) { // GUEST DESCONECTOU
+                if(res <= 0) { 
                     server_log("[SALA %d] GUEST '%s' desconectou.\n", r->id, r->name2);
                     if(r->game_status == 1 || r->game_status == 2) {
                         updateStats(r->name1, 1); updateStats(r->name2, 0);
@@ -269,7 +266,7 @@ DWORD WINAPI RoomThread(LPVOID arg) {
                     strcpy(r->name2, "Aguardando...");
                     r->score2 = 0;
                     r->current_player = 1;
-                    r->game_status = 0; // Host volta a aguardar
+                    r->game_status = 0;
                     initBalls(r);
                 } else if(r->game_status == 1 && r->current_player == 2) {
                     if(cmsg.key == 72 && r->m_y > 1) r->m_y--;
@@ -298,7 +295,7 @@ DWORD WINAPI ClientSetupThread(LPVOID arg) {
     SOCKET client = cd->client_sock;
     char client_ip[64];
     strcpy(client_ip, cd->ip);
-    free(cd); // Libera memoria alocada para o struct
+    free(cd);
 
     ClientMsg msg;
     ServerMsg reply;
