@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <winsock2.h>
 #include <windows.h>
 #include <math.h>
@@ -18,8 +19,83 @@
 #define TABLE_X2 50
 #define TABLE_Y2 20
 
+#define ROTL32(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
+
 sqlite3 *db;
 
+//Gera hash SHA-1 em formato hexadecimal
+void sha1_hash(const char *input, char output[41]) {
+    uint32_t h0 = 0x67452301;
+    uint32_t h1 = 0xEFCDAB89;
+    uint32_t h2 = 0x98BADCFE;
+    uint32_t h3 = 0x10325476;
+    uint32_t h4 = 0xC3D2E1F0;
+
+    size_t orig_len = strlen(input);
+    uint64_t bit_len = (uint64_t)orig_len * 8;
+
+    size_t padded_len = orig_len + 1;
+    while (padded_len % 64 != 56) {
+        padded_len++;
+    }
+    padded_len += 8;
+
+    uint8_t *msg = (uint8_t *)calloc(padded_len, 1);
+    memcpy(msg, input, orig_len);
+    msg[orig_len] = 0x80;
+
+    for (int i = 0; i < 8; i++) {
+        msg[padded_len - 8 + i] = (uint8_t)((bit_len >> ((7 - i) * 8)) & 0xFF);
+    }
+
+    for (size_t offset = 0; offset < padded_len; offset += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; i++) {
+            w[i] = ((uint32_t)msg[offset + i * 4] << 24) |
+                   ((uint32_t)msg[offset + i * 4 + 1] << 16) |
+                   ((uint32_t)msg[offset + i * 4 + 2] << 8) |
+                   ((uint32_t)msg[offset + i * 4 + 3]);
+        }
+        for (int i = 16; i < 80; i++) {
+            w[i] = ROTL32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+        }
+
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+
+        for (int i = 0; i < 80; i++) {
+            uint32_t f, k;
+            if (i < 20) {
+                f = (b & c) | ((~b) & d);
+                k = 0x5A827999;
+            } else if (i < 40) {
+                f = b ^ c ^ d;
+                k = 0x6ED9EBA1;
+            } else if (i < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 0x8F1BBCDC;
+            } else {
+                f = b ^ c ^ d;
+                k = 0xCA62C1D6;
+            }
+
+            uint32_t temp = ROTL32(a, 5) + f + e + k + w[i];
+            e = d;
+            d = c;
+            c = ROTL32(b, 30);
+            b = a;
+            a = temp;
+        }
+
+        h0 += a;
+        h1 += b;
+        h2 += c;
+        h3 += d;
+        h4 += e;
+    }
+
+    free(msg);
+    sprintf(output, "%08x%08x%08x%08x%08x", h0, h1, h2, h3, h4);
+}
 
 void server_log(const char *format, ...) {
     time_t now = time(NULL);
@@ -310,16 +386,19 @@ DWORD WINAPI ClientSetupThread(LPVOID arg) {
             return 0; 
         }
 
-        if(msg.action == 4) { // REGISTER
+        if(msg.action == 4) { // REGISTER COM HASH SHA-1
+            char hashed_pass[41];
+            sha1_hash(msg.password, hashed_pass);
+
             sqlite3_stmt *stmt;
             const char* sql = "INSERT INTO users (username, password) VALUES (?, ?)";
             if(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
                 sqlite3_bind_text(stmt, 1, msg.name, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 2, msg.password, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 2, hashed_pass, -1, SQLITE_TRANSIENT);
                 if(sqlite3_step(stmt) == SQLITE_DONE) {
                     reply.type = 3; strcpy(reply.message, "Conta registrada com sucesso!");
-                    strcpy(current_username, msg.name); // CORRIGIDO BUG 1
-                    server_log("[AUTH] Cadastro de '%s' [IP: %s].\n", msg.name, client_ip);
+                    strcpy(current_username, msg.name);
+                    server_log("[AUTH] Cadastro de '%s' (SHA-1) [IP: %s].\n", msg.name, client_ip);
                 } else {
                     reply.type = 1; strcpy(reply.message, "O nome de usuario ja existe.");
                     server_log("[AUTH] Falha de cadastro (Ja existe) [IP: %s].\n", client_ip);
@@ -328,12 +407,15 @@ DWORD WINAPI ClientSetupThread(LPVOID arg) {
             }
             send(client, (char*)&reply, sizeof(reply), 0);
         }
-        else if(msg.action == 5) { // LOGIN
+        else if(msg.action == 5) { // LOGIN COM HASH SHA-1
+            char hashed_pass[41];
+            sha1_hash(msg.password, hashed_pass);
+
             sqlite3_stmt *stmt;
             const char* sql = "SELECT id FROM users WHERE username = ? AND password = ?";
             if(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
                 sqlite3_bind_text(stmt, 1, msg.name, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(stmt, 2, msg.password, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(stmt, 2, hashed_pass, -1, SQLITE_TRANSIENT);
                 if(sqlite3_step(stmt) == SQLITE_ROW) {
                     reply.type = 3; strcpy(reply.message, "Login efetuado com sucesso!");
                     strcpy(current_username, msg.name);
