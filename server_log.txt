@@ -1,0 +1,16 @@
+[2026-11-17 21:41:29] [SISTEMA] Banco de dados SQLite carregado com sucesso!
+[2026-11-17 21:41:29] [SISTEMA] Servidor de Sinuca rodando na porta 8888...
+[2026-11-17 21:41:39] [REDE] Conexao estabelecida do IP: 127.0.0.1
+[2026-11-17 21:41:45] [AUTH] Cadastro de 'julio' (SHA-1) [IP: 127.0.0.1].
+[2026-11-17 21:44:06] [REDE] Conexao estabelecida do IP: 127.0.0.1
+[2026-11-17 21:44:40] [AUTH] Cadastro de 'nicolas' (SHA-1) [IP: 127.0.0.1].
+[2026-11-17 21:44:59] [ROOM] Sala 1 criada por 'nicolas'. Aguardando oponente...
+[2026-11-17 21:51:50] [REDE] Conexao estabelecida do IP: 127.0.0.1
+[2026-11-17 21:51:55] [AUTH] Usuario 'julio' logou [IP: 127.0.0.1].
+[2026-11-17 21:52:02] [ROOM] 'julio' entrou na sala 1.
+[2026-11-17 21:52:02] [PARTIDA] Iniciada Sala 1: nicolas vs julio
+[2026-11-17 21:54:31] [PARTIDA] Sala 1: Bola 8 encacapada!
+[2026-11-17 21:54:31] [PARTIDA] Sala 1: Vencedor: 'nicolas'. Atualizando Banco.
+[2026-11-17 21:54:35] [PARTIDA] Sala 1: 'nicolas' reiniciou a partida.
+[2026-11-17 21:54:42] [SALA 1] HOST 'nicolas' desconectou.
+[2026-11-17 21:54:42] [SALA 1] 'julio' agora e o novo HOST.
