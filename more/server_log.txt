@@ -14,3 +14,13 @@
 [2026-11-17 21:54:35] [PARTIDA] Sala 1: 'nicolas' reiniciou a partida.
 [2026-11-17 21:54:42] [SALA 1] HOST 'nicolas' desconectou.
 [2026-11-17 21:54:42] [SALA 1] 'julio' agora e o novo HOST.
+[2026-11-18 17:45:27] [SISTEMA] Banco de dados SQLite carregado com sucesso!
+[2026-11-18 17:45:27] [SISTEMA] Servidor de Sinuca rodando na porta 8888...
+[2026-11-18 17:45:39] [REDE] Conexao estabelecida do IP: 127.0.0.1
+[2026-11-18 17:45:48] [AUTH] Cadastro de 'nicolas' (SHA-1) [IP: 127.0.0.1].
+[2026-11-18 17:45:54] [ROOM] Sala 1 criada por 'nicolas'. Aguardando oponente...
+[2026-11-18 17:46:14] [REDE] Conexao estabelecida do IP: 127.0.0.1
+[2026-11-18 17:46:19] [AUTH] Cadastro de 'vini' (SHA-1) [IP: 127.0.0.1].
+[2026-11-18 17:46:22] [ROOM] 'vini' entrou na sala 1.
+[2026-11-18 17:46:22] [PARTIDA] Iniciada Sala 1: nicolas vs vini
+[2026-11-18 17:47:43] [SALA 1] GUEST 'vini' desconectou.
