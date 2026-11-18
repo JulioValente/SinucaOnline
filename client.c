@@ -5,6 +5,8 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <math.h>
+#include <stdint.h>
+#include <time.h>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -14,6 +16,9 @@
 #define TABLE_Y1 5
 #define TABLE_X2 50
 #define TABLE_Y2 20
+
+#define DH_PRIME 4294967291ULL
+#define DH_GEN   5ULL
 
 typedef struct {
     int action;
@@ -37,14 +42,81 @@ typedef struct {
     int is_host;
 } ServerMsg;
 
+typedef struct {
+    uint8_t S[256];
+    int i, j;
+} RC4State;
+
 ServerMsg gameState;
 SOCKET sock;
 int running = 1;
+RC4State enc_send, enc_recv;
 
+// === FUNÇÕES DE CRIPTOGRAFIA (DIFFIE-HELLMAN + RC4) ===
+uint64_t mod_exp(uint64_t base, uint64_t exp, uint64_t mod) {
+    uint64_t result = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp & 1) result = (result * base) % mod;
+        exp >>= 1;
+        base = (base * base) % mod;
+    }
+    return result;
+}
+
+void rc4_init(RC4State *st, uint64_t shared_key) {
+    uint8_t key[8];
+    for (int k = 0; k < 8; k++) key[k] = (uint8_t)((shared_key >> (k * 8)) & 0xFF);
+    for (int k = 0; k < 256; k++) st->S[k] = (uint8_t)k;
+    int j = 0;
+    for (int k = 0; k < 256; k++) {
+        j = (j + st->S[k] + key[k % 8]) & 0xFF;
+        uint8_t tmp = st->S[k]; st->S[k] = st->S[j]; st->S[j] = tmp;
+    }
+    st->i = 0;
+    st->j = 0;
+}
+
+void rc4_crypt(RC4State *st, uint8_t *data, size_t len) {
+    for (size_t k = 0; k < len; k++) {
+        st->i = (st->i + 1) & 0xFF;
+        st->j = (st->j + st->S[st->i]) & 0xFF;
+        uint8_t tmp = st->S[st->i]; st->S[st->i] = st->S[st->j]; st->S[st->j] = tmp;
+        data[k] ^= st->S[(st->S[st->i] + st->S[st->j]) & 0xFF];
+    }
+}
+
+int send_enc(SOCKET s, RC4State *st, const void *buf, int len) {
+    uint8_t tmp[1024];
+    if (len > (int)sizeof(tmp)) return -1;
+    memcpy(tmp, buf, len);
+    rc4_crypt(st, tmp, len);
+    int total = 0;
+    while (total < len) {
+        int sent = send(s, (char*)tmp + total, len - total, 0);
+        if (sent <= 0) return sent;
+        total += sent;
+    }
+    return total;
+}
+
+int recv_enc(SOCKET s, RC4State *st, void *buf, int len) {
+    int total = 0;
+    while (total < len) {
+        int r = recv(s, (char*)buf + total, len - total, 0);
+        if (r <= 0) return r;
+        total += r;
+    }
+    rc4_crypt(st, (uint8_t*)buf, len);
+    return total;
+}
+
+// === INTERFACE E RENDERIZAÇÃO ASCII ===
 void hideCursor() {
     HANDLE consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
     CONSOLE_CURSOR_INFO info;
-    info.dwSize = 100; info.bVisible = FALSE;
+    info.dwSize = 100;
+    info.bVisible = FALSE;
     SetConsoleCursorInfo(consoleHandle, &info);
 }
 
@@ -56,8 +128,8 @@ void setCursorPosition(int x, int y) {
 void draw() {
     char screen[HEIGHT][WIDTH + 1];
 
-    for(int y = 0; y < HEIGHT; y++) {
-        for(int x = 0; x < WIDTH; x++) { screen[y][x] = ' '; }
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) { screen[y][x] = ' '; }
         screen[y][WIDTH] = '\0';
     }
 
@@ -109,15 +181,15 @@ void draw() {
 }
 
 DWORD WINAPI ReceiveThread(LPVOID arg) {
-    while(running) {
-        int res = recv(sock, (char*)&gameState, sizeof(gameState), 0);
-        if(res <= 0) {
+    while (running) {
+        int res = recv_enc(sock, &enc_recv, &gameState, sizeof(gameState));
+        if (res <= 0) {
             system("cls");
             printf("Conexao com o servidor perdida!\n");
             running = 0;
             break;
         }
-        if(gameState.type == 1) {
+        if (gameState.type == 1) {
             printf("\nERRO DO SERVIDOR: %s\n", gameState.message);
             running = 0;
             break;
@@ -165,13 +237,38 @@ int main() {
     server.sin_port = htons(server_port);
 
     printf("\nConectando ao servidor...\n");
-    if(connect(sock, (struct sockaddr*)&server, sizeof(server)) < 0) {
+    if (connect(sock, (struct sockaddr*)&server, sizeof(server)) < 0) {
         printf("A conexao falhou! Nao foi possivel encontrar o servidor em %s:%d\n", server_ip, server_port);
         system("pause");
         return 1;
     }
 
-    while(1) {
+    // --- HANDSHAKE DIFFIE-HELLMAN ---
+    srand((unsigned int)(time(NULL) ^ GetCurrentProcessId()));
+    uint64_t priv_key = ((uint64_t)rand() << 16) ^ (uint64_t)rand() ^ 12345ULL;
+    uint64_t pub_client = mod_exp(DH_GEN, priv_key, DH_PRIME);
+    uint64_t pub_server = 0;
+
+    send(sock, (char*)&pub_client, sizeof(pub_client), 0);
+
+    int received_dh = 0;
+    while (received_dh < (int)sizeof(pub_server)) {
+        int r = recv(sock, (char*)&pub_server + received_dh, sizeof(pub_server) - received_dh, 0);
+        if (r <= 0) {
+            printf("Falha ao negociar criptografia com o servidor.\n");
+            closesocket(sock);
+            system("pause");
+            return 1;
+        }
+        received_dh += r;
+    }
+
+    uint64_t session_key = mod_exp(pub_server, priv_key, DH_PRIME);
+    rc4_init(&enc_send, session_key);
+    rc4_init(&enc_recv, session_key ^ 0xA5A5A5A5A5A5A5A5ULL);
+
+    // --- LOOP DE AUTENTICAÇÃO ---
+    while (1) {
         system("cls");
         printf("                                        $$\\                                        \n");
         printf("                                        \\__|                                       \n");
@@ -205,10 +302,15 @@ int main() {
         printf("Senha: ");
         scanf("%31s", msg.password);
 
-        send(sock, (char*)&msg, sizeof(msg), 0);
-        recv(sock, (char*)&gameState, sizeof(gameState), 0);
+        if (send_enc(sock, &enc_send, &msg, sizeof(msg)) <= 0 ||
+            recv_enc(sock, &enc_recv, &gameState, sizeof(gameState)) <= 0) {
+            printf("\nConexao perdida durante a autenticacao.\n");
+            closesocket(sock);
+            system("pause");
+            return 1;
+        }
 
-        if(gameState.type == 3) {
+        if (gameState.type == 3) {
             printf("\n%s\n", gameState.message);
             Sleep(1000);
             break; 
@@ -250,10 +352,15 @@ int main() {
         printf("Senha da Sala: ");
         scanf("%31s", msg.password);
 
-        send(sock, (char*)&msg, sizeof(msg), 0);
-        recv(sock, (char*)&gameState, sizeof(gameState), 0);
+        if (send_enc(sock, &enc_send, &msg, sizeof(msg)) <= 0 ||
+            recv_enc(sock, &enc_recv, &gameState, sizeof(gameState)) <= 0) {
+            printf("\nConexao perdida ao entrar na sala.\n");
+            closesocket(sock);
+            system("pause");
+            return 1;
+        }
 
-        if(gameState.type == 1) { 
+        if (gameState.type == 1) {
             printf("\nERRO: %s\n", gameState.message);
             system("pause");
         } else {
@@ -278,11 +385,13 @@ int main() {
                 continue;
             }
             msg.action = 3;
-            send(sock, (char*)&msg, sizeof(msg), 0);
+            send_enc(sock, &enc_send, &msg, sizeof(msg));
         }
         Sleep(10);
     }
     
+    closesocket(sock);
+    WSACleanup();
     system("pause");
     return 0;
 }

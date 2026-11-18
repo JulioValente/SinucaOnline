@@ -19,11 +19,124 @@
 #define TABLE_X2 50
 #define TABLE_Y2 20
 
+#define DH_PRIME 4294967291ULL
+#define DH_GEN   5ULL
 #define ROTL32(value, bits) (((value) << (bits)) | ((value) >> (32 - (bits))))
 
 sqlite3 *db;
 
-//Gera hash SHA-1 em formato hexadecimal
+typedef struct {
+    int action; // 1:CREATE, 2:JOIN, 3:INPUT, 4:REGISTER, 5:LOGIN
+    char name[32];
+    int room_id;
+    char password[32];
+    int key;
+} ClientMsg;
+
+typedef struct {
+    int type; // 1:ERROR, 2:UPDATE, 3:AUTH_SUCCESS
+    char message[64];
+    int game_status; // 0=WAIT, 1=AIM, 2=MOVE, 3=END
+    float bx[4], by[4];
+    int b_active[4];
+    int m_x, m_y;
+    int current_player;
+    int winner;
+    char name1[32], name2[32];
+    int score1, score2;
+    int is_host;
+} ServerMsg;
+
+typedef struct {
+    uint8_t S[256];
+    int i, j;
+} RC4State;
+
+typedef struct {
+    int active;
+    int id;
+    char password[32];
+    SOCKET p1, p2;
+    RC4State p1_send, p1_recv;
+    RC4State p2_send, p2_recv;
+    char name1[32], name2[32];
+    int score1, score2;
+    int game_status;
+    float bx[4], by[4], vx[4], vy[4];
+    int b_active[4];
+    int m_x, m_y;
+    int current_player;
+    int winner;
+    CRITICAL_SECTION lock;
+} Room;
+
+typedef struct {
+    SOCKET client_sock;
+    char ip[64];
+} ClientData;
+
+Room rooms[MAX_ROOMS];
+
+// === FUNÇÕES DE CRIPTOGRAFIA (DIFFIE-HELLMAN + RC4) ===
+uint64_t mod_exp(uint64_t base, uint64_t exp, uint64_t mod) {
+    uint64_t result = 1;
+    base %= mod;
+    while (exp > 0) {
+        if (exp & 1) result = (result * base) % mod;
+        exp >>= 1;
+        base = (base * base) % mod;
+    }
+    return result;
+}
+
+void rc4_init(RC4State *st, uint64_t shared_key) {
+    uint8_t key[8];
+    for (int k = 0; k < 8; k++) key[k] = (uint8_t)((shared_key >> (k * 8)) & 0xFF);
+    for (int k = 0; k < 256; k++) st->S[k] = (uint8_t)k;
+    int j = 0;
+    for (int k = 0; k < 256; k++) {
+        j = (j + st->S[k] + key[k % 8]) & 0xFF;
+        uint8_t tmp = st->S[k]; st->S[k] = st->S[j]; st->S[j] = tmp;
+    }
+    st->i = 0;
+    st->j = 0;
+}
+
+void rc4_crypt(RC4State *st, uint8_t *data, size_t len) {
+    for (size_t k = 0; k < len; k++) {
+        st->i = (st->i + 1) & 0xFF;
+        st->j = (st->j + st->S[st->i]) & 0xFF;
+        uint8_t tmp = st->S[st->i]; st->S[st->i] = st->S[st->j]; st->S[st->j] = tmp;
+        data[k] ^= st->S[(st->S[st->i] + st->S[st->j]) & 0xFF];
+    }
+}
+
+int send_enc(SOCKET s, RC4State *st, const void *buf, int len) {
+    uint8_t tmp[1024];
+    if (len > (int)sizeof(tmp)) return -1;
+    memcpy(tmp, buf, len);
+    rc4_crypt(st, tmp, len);
+    int total = 0;
+    while (total < len) {
+        int sent = send(s, (char*)tmp + total, len - total, 0);
+        if (sent <= 0) return sent;
+        total += sent;
+    }
+    return total;
+}
+
+int recv_enc(SOCKET s, RC4State *st, void *buf, int len) {
+    int total = 0;
+    while (total < len) {
+        int r = recv(s, (char*)buf + total, len - total, 0);
+        if (r <= 0) return r;
+        total += r;
+    }
+    rc4_crypt(st, (uint8_t*)buf, len);
+    return total;
+}
+
+// gera senha em hash SHA-1
 void sha1_hash(const char *input, char output[41]) {
     uint32_t h0 = 0x67452301;
     uint32_t h1 = 0xEFCDAB89;
@@ -118,52 +231,8 @@ void server_log(const char *format, ...) {
     va_end(args);
 }
 
-typedef struct {
-    int action;
-    char name[32];
-    int room_id;
-    char password[32];
-    int key; 
-} ClientMsg;
-
-typedef struct {
-    int type;
-    char message[64];
-    int game_status; 
-    float bx[4], by[4];
-    int b_active[4];
-    int m_x, m_y;
-    int current_player; 
-    int winner; 
-    char name1[32], name2[32];
-    int score1, score2;
-    int is_host;
-} ServerMsg;
-
-typedef struct {
-    int active;
-    int id;
-    char password[32];
-    SOCKET p1, p2;
-    char name1[32], name2[32];
-    int score1, score2;
-    int game_status;
-    float bx[4], by[4], vx[4], vy[4];
-    int b_active[4];
-    int m_x, m_y;
-    int current_player;
-    int winner;
-} Room;
-
-typedef struct {
-    SOCKET client_sock;
-    char ip[64];
-} ClientData;
-
-Room rooms[MAX_ROOMS];
-
 void initDB() {
-    if(sqlite3_open("sinuca.db", &db)) {
+    if (sqlite3_open("sinuca.db", &db)) {
         server_log("[ERRO] Nao foi possivel abrir BD: %s\n", sqlite3_errmsg(db));
         exit(0);
     }
@@ -178,7 +247,7 @@ void updateStats(const char* username, int is_winner) {
         "UPDATE users SET wins = wins + 1, games_played = games_played + 1 WHERE username = ?" :
         "UPDATE users SET games_played = games_played + 1 WHERE username = ?";
     
-    if(sqlite3_prepare_v2(db, query, -1, &stmt, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, query, -1, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, username, -1, SQLITE_TRANSIENT);
         sqlite3_step(stmt);
         sqlite3_finalize(stmt);
@@ -270,42 +339,65 @@ void broadcastState(Room *r) {
     msg.game_status = r->game_status;
     msg.current_player = r->current_player;
     msg.winner = r->winner;
-    msg.score1 = r->score1; msg.score2 = r->score2;
-    strcpy(msg.name1, r->name1); strcpy(msg.name2, r->name2);
-    msg.m_x = r->m_x; msg.m_y = r->m_y;
-    for(int i=0; i<4; i++) { msg.bx[i] = r->bx[i]; msg.by[i] = r->by[i]; msg.b_active[i] = r->b_active[i]; }
+    msg.score1 = r->score1;
+    msg.score2 = r->score2;
+    strcpy(msg.name1, r->name1);
+    strcpy(msg.name2, r->name2);
+    msg.m_x = r->m_x;
+    msg.m_y = r->m_y;
+    for (int i = 0; i < 4; i++) {
+        msg.bx[i] = r->bx[i];
+        msg.by[i] = r->by[i];
+        msg.b_active[i] = r->b_active[i];
+    }
 
-    if(r->p1) { msg.is_host = 1; send(r->p1, (char*)&msg, sizeof(msg), 0); }
-    if(r->p2) { msg.is_host = 0; send(r->p2, (char*)&msg, sizeof(msg), 0); }
+    if (r->p1) {
+        msg.is_host = 1;
+        send_enc(r->p1, &r->p1_send, &msg, sizeof(msg));
+    }
+    if (r->p2) {
+        msg.is_host = 0;
+        send_enc(r->p2, &r->p2_send, &msg, sizeof(msg));
+    }
 }
 
 DWORD WINAPI RoomThread(LPVOID arg) {
     Room *r = (Room*)arg;
     ClientMsg cmsg;
     
-    while(r->active) {
+    while (1) {
+        EnterCriticalSection(&r->lock);
+        if (!r->active) {
+            LeaveCriticalSection(&r->lock);
+            break;
+        }
+
         fd_set readfds;
         struct timeval tv = {0, 0};
         FD_ZERO(&readfds);
-        if(r->p1) FD_SET(r->p1, &readfds);
-        if(r->p2) FD_SET(r->p2, &readfds);
+        if (r->p1) FD_SET(r->p1, &readfds);
+        if (r->p2) FD_SET(r->p2, &readfds);
 
         int ready = select(0, &readfds, NULL, NULL, &tv);
-        if(ready > 0) {
-            // VERIFICA JOGADOR 1
-            if(r->p1 && FD_ISSET(r->p1, &readfds)) {
-                int res = recv(r->p1, (char*)&cmsg, sizeof(cmsg), 0);
-                if(res <= 0) { // HOST DESCONECTOU
+        if (ready > 0) {
+            // VERIFICA JOGADOR 1 (HOST)
+            if (r->p1 && FD_ISSET(r->p1, &readfds)) {
+                int res = recv_enc(r->p1, &r->p1_recv, &cmsg, sizeof(cmsg));
+                if (res <= 0) {
                     server_log("[SALA %d] HOST '%s' desconectou.\n", r->id, r->name1);
-                    if(r->game_status == 1 || r->game_status == 2) {
-                        updateStats(r->name1, 0); updateStats(r->name2, 1);
+                    if (r->p2 && (r->game_status == 1 || r->game_status == 2)) {
+                        updateStats(r->name1, 0);
+                        updateStats(r->name2, 1);
                     }
                     closesocket(r->p1);
                     r->p1 = 0;
                     
-                    if(r->p2) {
+                    // MIGRAÇÃO DE HOST
+                    if (r->p2) {
                         server_log("[SALA %d] '%s' agora e o novo HOST.\n", r->id, r->name2);
                         r->p1 = r->p2;
+                        r->p1_send = r->p2_send;
+                        r->p1_recv = r->p2_recv;
                         r->p2 = 0;
                         strcpy(r->name1, r->name2);
                         strcpy(r->name2, "Aguardando...");
@@ -315,27 +407,33 @@ DWORD WINAPI RoomThread(LPVOID arg) {
                         r->game_status = 0;
                         initBalls(r);
                     }
-                } else if(r->game_status == 1 && r->current_player == 1) {
-                    if(cmsg.key == 72 && r->m_y > 1) r->m_y--;
-                    if(cmsg.key == 80 && r->m_y < HEIGHT - 2) r->m_y++;
-                    if(cmsg.key == 75 && r->m_x > 1) r->m_x--;
-                    if(cmsg.key == 77 && r->m_x < WIDTH - 2) r->m_x++;
-                    if(cmsg.key == 32) {
-                        r->vx[0] = (r->bx[0] - r->m_x) * 0.15; r->vy[0] = (r->by[0] - r->m_y) * 0.15;
+                } else if (r->game_status == 1 && r->current_player == 1) {
+                    if (cmsg.key == 72 && r->m_y > 1) r->m_y--;
+                    if (cmsg.key == 80 && r->m_y < HEIGHT - 2) r->m_y++;
+                    if (cmsg.key == 75 && r->m_x > 1) r->m_x--;
+                    if (cmsg.key == 77 && r->m_x < WIDTH - 2) r->m_x++;
+                    if (cmsg.key == 32) {
+                        r->vx[0] = (r->bx[0] - r->m_x) * 0.15;
+                        r->vy[0] = (r->by[0] - r->m_y) * 0.15;
                         r->game_status = 2;
                     }
-                } else if(r->game_status == 3 && cmsg.key == 'r') {
+                } else if (r->game_status == 3 && cmsg.key == 'r') {
                     server_log("[PARTIDA] Sala %d: '%s' reiniciou a partida.\n", r->id, r->name1);
-                    initBalls(r); r->game_status = 1; r->winner = 0; r->current_player = 1;
+                    initBalls(r);
+                    r->game_status = 1;
+                    r->winner = 0;
+                    r->current_player = 1;
                 }
             }
 
-            if(r->p2 && FD_ISSET(r->p2, &readfds)) {
-                int res = recv(r->p2, (char*)&cmsg, sizeof(cmsg), 0);
-                if(res <= 0) { 
+            // VERIFICA JOGADOR 2 (GUEST)
+            if (r->p2 && FD_ISSET(r->p2, &readfds)) {
+                int res = recv_enc(r->p2, &r->p2_recv, &cmsg, sizeof(cmsg));
+                if (res <= 0) {
                     server_log("[SALA %d] GUEST '%s' desconectou.\n", r->id, r->name2);
-                    if(r->game_status == 1 || r->game_status == 2) {
-                        updateStats(r->name1, 1); updateStats(r->name2, 0);
+                    if (r->p1 && (r->game_status == 1 || r->game_status == 2)) {
+                        updateStats(r->name1, 1);
+                        updateStats(r->name2, 0);
                     }
                     closesocket(r->p2);
                     r->p2 = 0;
@@ -344,22 +442,30 @@ DWORD WINAPI RoomThread(LPVOID arg) {
                     r->current_player = 1;
                     r->game_status = 0;
                     initBalls(r);
-                } else if(r->game_status == 1 && r->current_player == 2) {
-                    if(cmsg.key == 72 && r->m_y > 1) r->m_y--;
-                    if(cmsg.key == 80 && r->m_y < HEIGHT - 2) r->m_y++;
-                    if(cmsg.key == 75 && r->m_x > 1) r->m_x--;
-                    if(cmsg.key == 77 && r->m_x < WIDTH - 2) r->m_x++;
-                    if(cmsg.key == 32) {
-                        r->vx[0] = (r->bx[0] - r->m_x) * 0.15; r->vy[0] = (r->by[0] - r->m_y) * 0.15;
+                } else if (r->game_status == 1 && r->current_player == 2) {
+                    if (cmsg.key == 72 && r->m_y > 1) r->m_y--;
+                    if (cmsg.key == 80 && r->m_y < HEIGHT - 2) r->m_y++;
+                    if (cmsg.key == 75 && r->m_x > 1) r->m_x--;
+                    if (cmsg.key == 77 && r->m_x < WIDTH - 2) r->m_x++;
+                    if (cmsg.key == 32) {
+                        r->vx[0] = (r->bx[0] - r->m_x) * 0.15;
+                        r->vy[0] = (r->by[0] - r->m_y) * 0.15;
                         r->game_status = 2;
                     }
                 }
             }
         }
 
-        if(r->game_status == 2) updatePhysics(r);
-        if(!r->p1 && !r->p2) { r->active = 0; break; } 
+        if (r->game_status == 2) updatePhysics(r);
+
+        if (!r->p1 && !r->p2) {
+            r->active = 0;
+            LeaveCriticalSection(&r->lock);
+            break;
+        }
+
         broadcastState(r);
+        LeaveCriticalSection(&r->lock);
         Sleep(30); 
     }
     server_log("[SALA %d] Encerrada (Vazia).\n", r->id);
@@ -380,108 +486,160 @@ DWORD WINAPI ClientSetupThread(LPVOID arg) {
 
     server_log("[REDE] Conexao estabelecida do IP: %s\n", client_ip);
 
-    while(1) {
-        if(recv(client, (char*)&msg, sizeof(msg), 0) <= 0) {
+    // --- HANDSHAKE DIFFIE-HELLMAN ---
+    uint64_t priv_key = ((uint64_t)rand() << 16) ^ (uint64_t)rand() ^ (uint64_t)client;
+    uint64_t pub_server = mod_exp(DH_GEN, priv_key, DH_PRIME);
+    uint64_t pub_client = 0;
+
+    int received_dh = 0;
+    while (received_dh < (int)sizeof(pub_client)) {
+        int r = recv(client, (char*)&pub_client + received_dh, sizeof(pub_client) - received_dh, 0);
+        if (r <= 0) {
+            closesocket(client);
+            return 0;
+        }
+        received_dh += r;
+    }
+
+    if (send(client, (char*)&pub_server, sizeof(pub_server), 0) <= 0) {
+        closesocket(client);
+        return 0;
+    }
+
+    uint64_t session_key = mod_exp(pub_client, priv_key, DH_PRIME);
+    RC4State client_recv, client_send;
+    rc4_init(&client_recv, session_key);
+    rc4_init(&client_send, session_key ^ 0xA5A5A5A5A5A5A5A5ULL);
+
+    while (1) {
+        if (recv_enc(client, &client_recv, &msg, sizeof(msg)) <= 0) {
             closesocket(client);
             return 0; 
         }
+        msg.name[31] = '\0';
+        msg.password[31] = '\0';
+        memset(&reply, 0, sizeof(reply));
 
-        if(msg.action == 4) { // REGISTER COM HASH SHA-1
+        if (msg.action == 4) { // REGISTER
             char hashed_pass[41];
             sha1_hash(msg.password, hashed_pass);
 
             sqlite3_stmt *stmt;
             const char* sql = "INSERT INTO users (username, password) VALUES (?, ?)";
-            if(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+            if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
                 sqlite3_bind_text(stmt, 1, msg.name, -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(stmt, 2, hashed_pass, -1, SQLITE_TRANSIENT);
-                if(sqlite3_step(stmt) == SQLITE_DONE) {
-                    reply.type = 3; strcpy(reply.message, "Conta registrada com sucesso!");
+                if (sqlite3_step(stmt) == SQLITE_DONE) {
+                    reply.type = 3;
+                    strcpy(reply.message, "Conta registrada com sucesso!");
                     strcpy(current_username, msg.name);
                     server_log("[AUTH] Cadastro de '%s' (SHA-1) [IP: %s].\n", msg.name, client_ip);
                 } else {
-                    reply.type = 1; strcpy(reply.message, "O nome de usuario ja existe.");
+                    reply.type = 1;
+                    strcpy(reply.message, "O nome de usuario ja existe.");
                     server_log("[AUTH] Falha de cadastro (Ja existe) [IP: %s].\n", client_ip);
                 }
                 sqlite3_finalize(stmt);
             }
-            send(client, (char*)&reply, sizeof(reply), 0);
-        }
-        else if(msg.action == 5) { // LOGIN COM HASH SHA-1
+            send_enc(client, &client_send, &reply, sizeof(reply));
+        } else if (msg.action == 5) { // LOGIN
             char hashed_pass[41];
             sha1_hash(msg.password, hashed_pass);
 
             sqlite3_stmt *stmt;
             const char* sql = "SELECT id FROM users WHERE username = ? AND password = ?";
-            if(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+            if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
                 sqlite3_bind_text(stmt, 1, msg.name, -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(stmt, 2, hashed_pass, -1, SQLITE_TRANSIENT);
-                if(sqlite3_step(stmt) == SQLITE_ROW) {
-                    reply.type = 3; strcpy(reply.message, "Login efetuado com sucesso!");
+                if (sqlite3_step(stmt) == SQLITE_ROW) {
+                    reply.type = 3;
+                    strcpy(reply.message, "Login efetuado com sucesso!");
                     strcpy(current_username, msg.name);
                     server_log("[AUTH] Usuario '%s' logou [IP: %s].\n", msg.name, client_ip);
                 } else {
-                    reply.type = 1; strcpy(reply.message, "Usuario ou senha incorretos.");
+                    reply.type = 1;
+                    strcpy(reply.message, "Usuario ou senha incorretos.");
                     server_log("[AUTH] Falha de login [IP: %s].\n", client_ip);
                 }
                 sqlite3_finalize(stmt);
             }
-            send(client, (char*)&reply, sizeof(reply), 0);
-        }
-        else if(msg.action == 1) { // CREATE ROOM
+            send_enc(client, &client_send, &reply, sizeof(reply));
+        } else if (msg.action == 1) { // CREATE ROOM
             int created = 0;
-            for(int i = 0; i < MAX_ROOMS; i++) {
-                if(!rooms[i].active) {
-                    rooms[i].active = 1; rooms[i].id = msg.room_id;
+            for (int i = 0; i < MAX_ROOMS; i++) {
+                EnterCriticalSection(&rooms[i].lock);
+                if (!rooms[i].active) {
+                    rooms[i].active = 1;
+                    rooms[i].id = msg.room_id;
                     strcpy(rooms[i].password, msg.password);
                     strcpy(rooms[i].name1, current_username);
                     strcpy(rooms[i].name2, "Aguardando...");
-                    rooms[i].p1 = client; rooms[i].p2 = 0;
-                    rooms[i].score1 = 0; rooms[i].score2 = 0;
-                    rooms[i].game_status = 0; rooms[i].current_player = 1;
+                    rooms[i].p1 = client;
+                    rooms[i].p1_send = client_send;
+                    rooms[i].p1_recv = client_recv;
+                    rooms[i].p2 = 0;
+                    rooms[i].score1 = 0;
+                    rooms[i].score2 = 0;
+                    rooms[i].game_status = 0;
+                    rooms[i].current_player = 1;
                     initBalls(&rooms[i]);
                     
                     CreateThread(NULL, 0, RoomThread, &rooms[i], 0, NULL);
                     created = 1;
                     server_log("[ROOM] Sala %d criada por '%s'. Aguardando oponente...\n", msg.room_id, current_username);
+                    LeaveCriticalSection(&rooms[i].lock);
                     break;
                 }
+                LeaveCriticalSection(&rooms[i].lock);
             }
-            if(created) return 0;
-            else {
-                reply.type = 1; strcpy(reply.message, "Servidor lotado!");
-                send(client, (char*)&reply, sizeof(reply), 0);
-            }
-        }
-        else if(msg.action == 2) { // JOIN ROOM
+            if (created) return 0;
+
+            reply.type = 1;
+            strcpy(reply.message, "Servidor lotado!");
+            send_enc(client, &client_send, &reply, sizeof(reply));
+        } else if (msg.action == 2) { // JOIN ROOM
             int joined = 0;
-            for(int i = 0; i < MAX_ROOMS; i++) {
-                if(rooms[i].active && rooms[i].id == msg.room_id) {
-                    if(strcmp(rooms[i].password, msg.password) != 0) {
-                        reply.type = 1; strcpy(reply.message, "Senha da sala incorreta.");
-                    } else if(rooms[i].p2 != 0) {
-                        reply.type = 1; strcpy(reply.message, "A sala ja esta cheia.");
+            for (int i = 0; i < MAX_ROOMS; i++) {
+                EnterCriticalSection(&rooms[i].lock);
+                if (rooms[i].active && rooms[i].id == msg.room_id) {
+                    if (strcmp(rooms[i].password, msg.password) != 0) {
+                        reply.type = 1;
+                        strcpy(reply.message, "Senha da sala incorreta.");
+                    } else if (rooms[i].p2 != 0) {
+                        reply.type = 1;
+                        strcpy(reply.message, "A sala ja esta cheia.");
                     } else {
                         rooms[i].p2 = client;
+                        rooms[i].p2_send = client_send;
+                        rooms[i].p2_recv = client_recv;
                         strcpy(rooms[i].name2, current_username);
                         rooms[i].game_status = 1; 
                         joined = 1;
                         server_log("[ROOM] '%s' entrou na sala %d.\n", current_username, msg.room_id);
                         server_log("[PARTIDA] Iniciada Sala %d: %s vs %s\n", msg.room_id, rooms[i].name1, rooms[i].name2);
                     }
+                    LeaveCriticalSection(&rooms[i].lock);
                     break;
                 }
+                LeaveCriticalSection(&rooms[i].lock);
             }
-            if(joined) return 0;
-            else {
-                if(reply.type != 1) { reply.type = 1; strcpy(reply.message, "Sala nao encontrada."); }
-                send(client, (char*)&reply, sizeof(reply), 0);
+            if (joined) return 0;
+
+            if (reply.type != 1) {
+                reply.type = 1;
+                strcpy(reply.message, "Sala nao encontrada.");
             }
+            send_enc(client, &client_send, &reply, sizeof(reply));
         }
     }
 }
 
 int main() {
+    srand((unsigned int)time(NULL));
+    for (int i = 0; i < MAX_ROOMS; i++) {
+        InitializeCriticalSection(&rooms[i].lock);
+    }
+
     initDB();
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -496,12 +654,12 @@ int main() {
     listen(server_fd, 5);
     server_log("[SISTEMA] Servidor de Sinuca rodando na porta 8888...\n");
 
-    while(1) {
+    while (1) {
         struct sockaddr_in client_info;
         int addr_len = sizeof(client_info);
         SOCKET client = accept(server_fd, (struct sockaddr*)&client_info, &addr_len);
         
-        if(client != INVALID_SOCKET) {
+        if (client != INVALID_SOCKET) {
             ClientData *cd = (ClientData*)malloc(sizeof(ClientData));
             cd->client_sock = client;
             strcpy(cd->ip, inet_ntoa(client_info.sin_addr));
